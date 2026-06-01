@@ -6,6 +6,10 @@
 #include <random>
 #include <vector>
 
+#ifdef _OPENMP
+#include <omp.h>
+#endif
+
 namespace {
 
 inline int clampi(int v, int lo, int hi) { return v < lo ? lo : (v > hi ? hi : v); }
@@ -15,13 +19,81 @@ inline uint8_t clamp8(float v)
     return (uint8_t)(i < 0 ? 0 : (i > 255 ? 255 : i));
 }
 
+// ---- summed-area table (integral image) over RGB ------------------------
+// Stored as (w+1) x (h+1) with the zeroth row/col padded with zeros, so the
+// box query x in [x0..x1], y in [y0..y1] is just four lookups.
+struct RgbSAT
+{
+    int w = 0, h = 0;
+    int sw = 0;                       // stride = w + 1
+    std::vector<uint64_t> r, g, b;    // (w+1) * (h+1)
+};
+
+static RgbSAT BuildRgbSAT(const Image& img)
+{
+    RgbSAT s;
+    s.w = img.w; s.h = img.h; s.sw = img.w + 1;
+    const size_t n = size_t(s.sw) * size_t(img.h + 1);
+    s.r.assign(n, 0);
+    s.g.assign(n, 0);
+    s.b.assign(n, 0);
+
+    // Row-wise running sums fed into column-wise accumulation -- O(w*h).
+    for (int y = 0; y < img.h; ++y)
+    {
+        uint64_t rowR = 0, rowG = 0, rowB = 0;
+        const uint8_t* p = img.rgba.data() + size_t(y) * img.w * 4;
+        const size_t rowBase = size_t(y + 1) * s.sw;
+        const size_t upBase  = size_t(y    ) * s.sw;
+        for (int x = 0; x < img.w; ++x)
+        {
+            rowR += p[0]; rowG += p[1]; rowB += p[2];
+            p += 4;
+            const size_t idx = rowBase + (x + 1);
+            const size_t up  = upBase  + (x + 1);
+            s.r[idx] = s.r[up] + rowR;
+            s.g[idx] = s.g[up] + rowG;
+            s.b[idx] = s.b[up] + rowB;
+        }
+    }
+    return s;
+}
+
+// Average RGB inside the axis-aligned box [cx-half..cx+half] x [cy-half..cy+half],
+// clipped to the image. O(1).
+inline void BoxAverage(const RgbSAT& s, int cx, int cy, int half,
+                       uint8_t& outR, uint8_t& outG, uint8_t& outB)
+{
+    const int x0 = std::max(0, cx - half);
+    const int y0 = std::max(0, cy - half);
+    const int x1 = std::min(s.w - 1, cx + half);
+    const int y1 = std::min(s.h - 1, cy + half);
+    if (x1 < x0 || y1 < y0) { outR = outG = outB = 0; return; }
+    const int n = (x1 - x0 + 1) * (y1 - y0 + 1);
+    const size_t A = size_t(y0)     * s.sw;
+    const size_t B = size_t(y1 + 1) * s.sw;
+    const int    L = x0;
+    const int    R = x1 + 1;
+    const uint64_t sumR = s.r[B + R] - s.r[A + R] - s.r[B + L] + s.r[A + L];
+    const uint64_t sumG = s.g[B + R] - s.g[A + R] - s.g[B + L] + s.g[A + L];
+    const uint64_t sumB = s.b[B + R] - s.b[A + R] - s.b[B + L] + s.b[A + L];
+    outR = uint8_t(sumR / uint64_t(n));
+    outG = uint8_t(sumG / uint64_t(n));
+    outB = uint8_t(sumB / uint64_t(n));
+}
+
 // ---- gray + gaussian blur + Sobel ----------------------------------------
 static std::vector<float> ToGrayLuma(const Image& img)
 {
     std::vector<float> g(size_t(img.w) * img.h);
-    const uint8_t* p = img.rgba.data();
-    for (size_t i = 0, n = g.size(); i < n; ++i, p += 4)
+    const int total = (int)g.size();
+    const uint8_t* base = img.rgba.data();
+#pragma omp parallel for schedule(static)
+    for (int i = 0; i < total; ++i)
+    {
+        const uint8_t* p = base + size_t(i) * 4;
         g[i] = 0.2126f * p[0] + 0.7152f * p[1] + 0.0722f * p[2];
+    }
     return g;
 }
 
@@ -48,6 +120,7 @@ static void BlurSeparable(std::vector<float>& buf, int w, int h, float sigma)
     auto kernel = Gaussian1DKernel(sigma);
     int radius = (int)kernel.size() / 2;
     std::vector<float> tmp(buf.size());
+#pragma omp parallel for schedule(static)
     for (int y = 0; y < h; ++y)
     {
         const float* row = &buf[size_t(y) * w];
@@ -60,6 +133,7 @@ static void BlurSeparable(std::vector<float>& buf, int w, int h, float sigma)
             out[x] = acc;
         }
     }
+#pragma omp parallel for schedule(static)
     for (int y = 0; y < h; ++y)
     {
         float* out = &buf[size_t(y) * w];
@@ -78,6 +152,7 @@ static void Sobel3x3(const std::vector<float>& gray, int w, int h,
 {
     gx.assign(gray.size(), 0.f);
     gy.assign(gray.size(), 0.f);
+#pragma omp parallel for schedule(static)
     for (int y = 1; y < h - 1; ++y)
     {
         for (int x = 1; x < w - 1; ++x)
@@ -130,26 +205,6 @@ inline void PaintDisk(Canvas& c, int cx, int cy, int r,
             c.painted[idx] = 1;
         }
     }
-}
-
-inline void AverageColor3x3(const Image& src, int cx, int cy,
-                            uint8_t& outR, uint8_t& outG, uint8_t& outB)
-{
-    int rs = 0, gs = 0, bs = 0, n = 0;
-    for (int dy = -1; dy <= 1; ++dy)
-    {
-        const int y = clampi(cy + dy, 0, src.h - 1);
-        for (int dx = -1; dx <= 1; ++dx)
-        {
-            const int x = clampi(cx + dx, 0, src.w - 1);
-            const uint8_t* p = src.rgba.data() + (size_t(y) * src.w + x) * 4;
-            rs += p[0]; gs += p[1]; bs += p[2];
-            ++n;
-        }
-    }
-    outR = uint8_t(rs / n);
-    outG = uint8_t(gs / n);
-    outB = uint8_t(bs / n);
 }
 
 // Walks one half of a stroke from (sx,sy) along (ptx,pty).
@@ -216,14 +271,14 @@ static void WalkHalf(const WalkInputs& W,
     }
 }
 
-static void RunStroke(const WalkInputs& W,
-                      int sx, int sy,
-                      float ctx, float cty)
+static void RunStroke(const WalkInputs& W, const RgbSAT& sat,
+                      int sx, int sy, int colorHalf,
+                      float texDirX, float texDirY)
 {
     if (sx < 0 || sx >= W.w || sy < 0 || sy >= W.h) return;
 
     uint8_t br, bg, bb;
-    AverageColor3x3(*W.src, sx, sy, br, bg, bb);
+    BoxAverage(sat, sx, sy, colorHalf, br, bg, bb);
 
     // Seed dab (covers the case where both halves break immediately).
     PaintDisk(*W.canvas, sx, sy, W.radius, br, bg, bb, W.blend, W.alpha);
@@ -235,16 +290,81 @@ static void RunStroke(const WalkInputs& W,
         tx = -(*W.gy)[idx];
         ty =  (*W.gx)[idx];
         const float L = std::sqrt(tx * tx + ty * ty);
-        if (L < 1e-6f) { tx = ctx; ty = cty; }
+        if (L < 1e-6f) { tx = texDirX; ty = texDirY; }
         else { tx /= L; ty /= L; }
     }
     else
     {
-        tx = ctx; ty = cty;
+        tx = texDirX; ty = texDirY;
     }
 
     WalkHalf(W, (float)sx, (float)sy,  tx,  ty, br, bg, bb);
     WalkHalf(W, (float)sx, (float)sy, -tx, -ty, br, bg, bb);
+}
+
+// Build the seed list at the coarsest scale: one jittered seed per RxR cell.
+// Then a uniform-random keep at p.samplingRatio. This gives much better
+// coverage than purely uniform pixel sampling at the same stroke count.
+static std::vector<int> BuildGridJitteredSeeds(int w, int h, int spacing,
+                                               float keepRatio, std::mt19937& rng)
+{
+    spacing = std::max(1, spacing);
+    const int cellsX = (w + spacing - 1) / spacing;
+    const int cellsY = (h + spacing - 1) / spacing;
+    std::vector<int> seeds;
+    seeds.reserve(size_t(cellsX) * size_t(cellsY));
+
+    std::uniform_real_distribution<float> uj(-0.5f, 0.5f);
+    for (int cy = 0; cy < cellsY; ++cy)
+    {
+        for (int cx = 0; cx < cellsX; ++cx)
+        {
+            const float gx = (cx + 0.5f) * spacing + uj(rng) * spacing;
+            const float gy = (cy + 0.5f) * spacing + uj(rng) * spacing;
+            const int sx = clampi((int)std::lround(gx), 0, w - 1);
+            const int sy = clampi((int)std::lround(gy), 0, h - 1);
+            seeds.push_back(sy * w + sx);
+        }
+    }
+    if (keepRatio < 0.999f)
+    {
+        std::shuffle(seeds.begin(), seeds.end(), rng);
+        const size_t keep = std::max<size_t>(1, (size_t)std::lround(keepRatio * (double)seeds.size()));
+        if (keep < seeds.size()) seeds.resize(keep);
+    }
+    return seeds;
+}
+
+// Parallel collect of pixel indices where pred(i) holds. pred is called from
+// many threads concurrently so it must be thread-safe (read-only here).
+template <class Pred>
+static std::vector<int> ParallelCollect(int total, Pred pred)
+{
+#ifdef _OPENMP
+    const int T = std::max(1, omp_get_max_threads());
+    std::vector<std::vector<int>> partials(T);
+#pragma omp parallel
+    {
+        const int tid = omp_get_thread_num();
+        auto& local = partials[tid];
+        local.reserve(size_t(total) / size_t(T * 8));
+#pragma omp for nowait schedule(static)
+        for (int i = 0; i < total; ++i)
+            if (pred(i)) local.push_back(i);
+    }
+    size_t n = 0;
+    for (auto& v : partials) n += v.size();
+    std::vector<int> out;
+    out.reserve(n);
+    for (auto& v : partials) out.insert(out.end(), v.begin(), v.end());
+    return out;
+#else
+    std::vector<int> out;
+    out.reserve(size_t(total) / 8);
+    for (int i = 0; i < total; ++i)
+        if (pred(i)) out.push_back(i);
+    return out;
+#endif
 }
 
 } // namespace
@@ -263,16 +383,24 @@ Image Stylize(const Image& src, const BrushStrokeParams& p, StylizeContext* ctx)
     auto cancelled = [&]() { return ctx && ctx->cancel.load(std::memory_order_relaxed); };
     report(0.f);
 
-    // 1) gradient (luma -> blur -> Sobel 3x3)
+    // 1) gradient (luma -> blur -> Sobel 3x3) + |grad|
     std::vector<float> gray = ToGrayLuma(src);
     const int kernel = std::max(3, p.gradientKernel | 1);
     if (kernel > 3)
         BlurSeparable(gray, w, h, (kernel - 1) * 0.25f);
     std::vector<float> gx, gy;
     Sobel3x3(gray, w, h, gx, gy);
+
     std::vector<float> mag(N);
-    for (size_t i = 0; i < N; ++i)
-        mag[i] = std::sqrt(gx[i] * gx[i] + gy[i] * gy[i]);
+    {
+        const int total = (int)N;
+#pragma omp parallel for schedule(static)
+        for (int i = 0; i < total; ++i)
+            mag[i] = std::sqrt(gx[i] * gx[i] + gy[i] * gy[i]);
+    }
+
+    // 2) SAT for fast box-average color sampling at any brush radius
+    const RgbSAT sat = BuildRgbSAT(src);
 
     // Canvas + painted mask
     std::vector<uint8_t> painted(N, 0);
@@ -298,10 +426,8 @@ Image Stylize(const Image& src, const BrushStrokeParams& p, StylizeContext* ctx)
     const int maxR = radii.front();
 
     std::mt19937 rng(p.seed);
-    std::uniform_int_distribution<int> ux(0, w - 1), uy(0, h - 1);
 
     // Progress budget: 5% prep + 85% scales (equal split) + 10% refill (scale 0).
-    // Refill share is included even when maxRefillPasses==0 so the bar still reaches 1.0.
     report(0.05f);
     if (cancelled()) return Image{};
 
@@ -330,36 +456,34 @@ Image Stylize(const Image& src, const BrushStrokeParams& p, StylizeContext* ctx)
         const int strokeLen = std::max(2, (int)std::lround((double)p.strokeLength * (double)R / (double)maxR));
         W.radius = R;
         W.steps  = std::max(1, strokeLen / 2);
+        const int colorHalf = std::max(1, R);
 
         // Build the seed list for this scale.
         std::vector<int> seeds;
         if (scaleIdx == 0)
         {
-            const int seedCount = std::max(1, (int)std::lround(p.samplingRatio * (double)N));
-            seeds.reserve(seedCount);
-            for (int i = 0; i < seedCount; ++i)
-                seeds.push_back(uy(rng) * w + ux(rng));
+            // Grid-jittered: one candidate per RxR cell, then keep samplingRatio of them.
+            seeds = BuildGridJitteredSeeds(w, h, std::max(1, R), p.samplingRatio, rng);
         }
         else
         {
             // Detail pass: only seed from pixels where the canvas diverges
             // from the source by more than errorThreshold.
             const float errSq = p.errorThreshold * p.errorThreshold;
-            std::vector<int> highError;
-            highError.reserve(N / 4);
-            for (size_t i = 0; i < N; ++i)
+            const uint8_t* dstBase = dst.rgba.data();
+            const uint8_t* srcBase = src.rgba.data();
+            std::vector<int> highError = ParallelCollect((int)N, [&](int i)
             {
-                const uint8_t* a = dst.rgba.data() + i * 4;
-                const uint8_t* b = src.rgba.data() + i * 4;
+                const uint8_t* a = dstBase + size_t(i) * 4;
+                const uint8_t* b = srcBase + size_t(i) * 4;
                 const float dr = float(a[0]) - float(b[0]);
                 const float dg = float(a[1]) - float(b[1]);
                 const float db = float(a[2]) - float(b[2]);
-                if (dr * dr + dg * dg + db * db > errSq)
-                    highError.push_back((int)i);
-            }
-            if (highError.empty()) continue;
+                return (dr * dr + dg * dg + db * db) > errSq;
+            });
+            if (highError.empty()) { progressBase += perScaleShare; report(progressBase); continue; }
             std::shuffle(highError.begin(), highError.end(), rng);
-            const int take = std::max(1, (int)std::lround(p.samplingRatio * (double)highError.size()));
+            const size_t take = std::max<size_t>(1, (size_t)std::lround(p.samplingRatio * (double)highError.size()));
             seeds.assign(highError.begin(), highError.begin() + std::min<size_t>(take, highError.size()));
         }
 
@@ -373,7 +497,7 @@ Image Stylize(const Image& src, const BrushStrokeParams& p, StylizeContext* ctx)
             const int idx = seeds[i];
             const int sy = idx / w;
             const int sx = idx % w;
-            RunStroke(W, sx, sy, texDirX, texDirY);
+            RunStroke(W, sat, sx, sy, colorHalf, texDirX, texDirY);
         }
         progressBase += perScaleShare;
         report(progressBase);
@@ -382,30 +506,30 @@ Image Stylize(const Image& src, const BrushStrokeParams& p, StylizeContext* ctx)
         if (scaleIdx == 0)
         {
             const int passes = std::max(0, p.maxRefillPasses);
+            const uint8_t* paintedBase = painted.data();
             for (int pass = 0; pass < passes; ++pass)
             {
                 if (cancelled()) return Image{};
-                std::vector<int> empties;
-                empties.reserve(N / 8);
-                for (size_t i = 0; i < N; ++i)
-                    if (!painted[i]) empties.push_back((int)i);
+                std::vector<int> empties = ParallelCollect((int)N, [&](int i) { return !paintedBase[i]; });
                 if (empties.empty()) break;
                 std::shuffle(empties.begin(), empties.end(), rng);
                 for (int idx : empties)
                 {
                     if (painted[idx]) continue;
-                    RunStroke(W, idx % w, idx / w, texDirX, texDirY);
+                    RunStroke(W, sat, idx % w, idx / w, colorHalf, texDirX, texDirY);
                 }
                 report(progressBase + kRefillShare * float(pass + 1) / float(passes));
             }
             // Final 1-px dab for stragglers (rare; keeps the canvas covered).
-            for (size_t i = 0; i < N; ++i)
+            const int totalPx = (int)N;
+#pragma omp parallel for schedule(static)
+            for (int i = 0; i < totalPx; ++i)
             {
                 if (painted[i]) continue;
-                const int y = (int)(i / w), x = (int)(i % w);
+                const int y = i / w, x = i % w;
                 uint8_t br, bg, bb;
-                AverageColor3x3(src, x, y, br, bg, bb);
-                uint8_t* q = dst.rgba.data() + i * 4;
+                BoxAverage(sat, x, y, 1, br, bg, bb);
+                uint8_t* q = dst.rgba.data() + size_t(i) * 4;
                 q[0] = br; q[1] = bg; q[2] = bb; q[3] = 255;
                 painted[i] = 1;
             }
