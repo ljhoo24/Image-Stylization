@@ -148,17 +148,22 @@ static bool SaveImageToPath(const wchar_t* path, const Image& img)
     std::wstring p(path), ext;
     if (auto dot = p.find_last_of(L'.'); dot != std::wstring::npos) ext = p.substr(dot);
     for (auto& c : ext) c = (wchar_t)std::towlower(c);
+    // Bail BEFORE creating the file, otherwise an unknown extension leaves a 0-byte file behind.
+    const bool isPng = (ext == L".png");
+    const bool isJpg = (ext == L".jpg" || ext == L".jpeg");
+    if (!isPng && !isJpg) return false;
 
     FILE* f = nullptr;
     if (_wfopen_s(&f, path, L"wb") != 0 || !f) return false;
     bool ok = false;
-    if (ext == L".png")
+    if (isPng)
         ok = stbi_write_png_to_func(StbiWriteToFile, f, img.w, img.h, 4,
                                     img.rgba.data(), img.w * 4) != 0;
-    else if (ext == L".jpg" || ext == L".jpeg")
+    else
         ok = stbi_write_jpg_to_func(StbiWriteToFile, f, img.w, img.h, 4,
                                     img.rgba.data(), 92) != 0;
     fclose(f);
+    if (!ok) _wremove(path);
     return ok;
 }
 
@@ -399,7 +404,7 @@ static void DrawSettingsPanel(BrushStrokeParams& p)
         int seedI = (int)p.seed;
         if (ImGui::InputInt("Seed", &seedI)) p.seed = (uint32_t)seedI;
         ImGui::SameLine();
-        if (ImGui::SmallButton("Randomize")) p.seed = (uint32_t)GetTickCount();
+        if (ImGui::SmallButton("Randomize")) p.seed = (uint32_t)GetTickCount64();
     }
 }
 
@@ -531,9 +536,17 @@ int main(int, char**)
         if (g_ResizeWidth != 0 && g_ResizeHeight != 0)
         {
             CleanupRenderTarget();
-            g_pSwapChain->ResizeBuffers(0, g_ResizeWidth, g_ResizeHeight, DXGI_FORMAT_UNKNOWN, 0);
+            const HRESULT hr = g_pSwapChain->ResizeBuffers(0, g_ResizeWidth, g_ResizeHeight, DXGI_FORMAT_UNKNOWN, 0);
             g_ResizeWidth = g_ResizeHeight = 0;
-            CreateRenderTarget();
+            if (SUCCEEDED(hr))
+            {
+                CreateRenderTarget();
+            }
+            else
+            {
+                // Skip this frame; next WM_SIZE retriggers the resize.
+                continue;
+            }
         }
 
         // Consume a dropped file path (filled in by WM_DROPFILES on the UI thread).
