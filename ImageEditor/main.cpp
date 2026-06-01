@@ -64,8 +64,22 @@ struct GpuTexture
     }
     bool Upload(ID3D11Device* dev, const Image& img)
     {
+        if (!img.valid()) { Release(); return false; }
+
+        // Fast path: same dimensions -> just stream new pixels into the existing texture.
+        if (tex && srv && w == img.w && h == img.h)
+        {
+            ID3D11DeviceContext* ctx = nullptr;
+            dev->GetImmediateContext(&ctx);
+            if (ctx)
+            {
+                ctx->UpdateSubresource(tex, 0, nullptr, img.rgba.data(), UINT(img.w) * 4u, 0);
+                ctx->Release();
+                return true;
+            }
+        }
+
         Release();
-        if (!img.valid()) return false;
 
         D3D11_TEXTURE2D_DESC desc = {};
         desc.Width = img.w;
