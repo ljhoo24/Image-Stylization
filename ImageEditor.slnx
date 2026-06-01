@@ -1,0 +1,7 @@
+<Solution>
+  <Configurations>
+    <Platform Name="x64" />
+    <Platform Name="x86" />
+  </Configurations>
+  <Project Path="ImageEditor/ImageEditor.vcxproj" Id="29b934f0-373f-473d-8b25-c86a66725494" />
+</Solution>
