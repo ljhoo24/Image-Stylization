@@ -13,7 +13,9 @@
 #include <commdlg.h>
 #include <shellapi.h>
 
+#include <algorithm>
 #include <atomic>
+#include <cmath>
 #include <cstdio>
 #include <cstdint>
 #include <cwctype>
@@ -33,6 +35,8 @@
 #pragma comment(lib, "dxgi.lib")
 #pragma comment(lib, "d3dcompiler.lib")
 #pragma comment(lib, "comdlg32.lib")
+#pragma comment(lib, "shell32.lib")
+#pragma comment(lib, "user32.lib")
 
 // ---------- D3D globals ----------
 static ID3D11Device*            g_pd3dDevice = nullptr;
@@ -40,6 +44,12 @@ static ID3D11DeviceContext*     g_pd3dDeviceContext = nullptr;
 static IDXGISwapChain*          g_pSwapChain = nullptr;
 static UINT                     g_ResizeWidth = 0, g_ResizeHeight = 0;
 static ID3D11RenderTargetView*  g_mainRenderTargetView = nullptr;
+
+// ---------- Drag-and-drop handoff (WndProc -> main loop) ----------
+// WM_DROPFILES is dispatched on the UI thread (same one that calls PeekMessage),
+// so no synchronization is needed for these.
+static std::wstring g_droppedPath;
+static bool         g_hasDropped = false;
 
 static bool CreateDeviceD3D(HWND hWnd);
 static void CleanupDeviceD3D();
@@ -200,27 +210,145 @@ static bool SaveFileDialog(HWND owner, std::wstring& outPath)
 }
 
 // ---------- UI helpers ----------
-static void DrawImagePane(const char* title, const GpuTexture& tex, const char* emptyHint)
+// Per-pane zoom/pan state. zoom=0 means "fit to pane"; > 0 is an explicit user zoom.
+struct PaneView
+{
+    float  zoom = 0.f;            // 0 = fit, otherwise pixels/source-pixel
+    ImVec2 pan{ 0.f, 0.f };       // offset in screen pixels from centered
+};
+
+// Returns the "fit" scale for the texture inside an avail-sized box.
+static float FitScale(int texW, int texH, ImVec2 avail)
+{
+    if (texW <= 0 || texH <= 0) return 1.f;
+    const float sx = avail.x / float(texW);
+    const float sy = avail.y / float(texH);
+    return (sx < sy) ? sx : sy;
+}
+
+// Handles wheel-zoom (anchored at the mouse), drag-pan, and double-click reset.
+static void HandlePaneInteraction(PaneView& v, int texW, int texH, ImVec2 avail)
+{
+    if (texW <= 0 || texH <= 0) return;
+    if (!ImGui::IsWindowHovered(ImGuiHoveredFlags_ChildWindows)) return;
+
+    const ImGuiIO& io = ImGui::GetIO();
+    const float fit  = FitScale(texW, texH, avail);
+    const float curZ = (v.zoom > 0.f) ? v.zoom : fit;
+
+    if (io.MouseWheel != 0.f)
+    {
+        const float zMul = std::pow(1.1f, io.MouseWheel);
+        const float newZ = std::clamp(curZ * zMul, fit * 0.25f, 64.f);
+        // Anchor zoom at the mouse: keep the source pixel under the cursor steady.
+        const ImVec2 winPos = ImGui::GetWindowPos();
+        const ImVec2 mouse  = ImGui::GetMousePos();
+        const ImVec2 center{ winPos.x + avail.x * 0.5f, winPos.y + avail.y * 0.5f + ImGui::GetTextLineHeightWithSpacing() };
+        const ImVec2 m{ mouse.x - center.x - v.pan.x, mouse.y - center.y - v.pan.y };
+        const float k = newZ / curZ - 1.f;
+        v.pan.x -= m.x * k;
+        v.pan.y -= m.y * k;
+        v.zoom = newZ;
+    }
+    if (ImGui::IsMouseDragging(ImGuiMouseButton_Left, 1.0f))
+    {
+        const ImVec2 d = ImGui::GetMouseDragDelta(ImGuiMouseButton_Left);
+        ImGui::ResetMouseDragDelta(ImGuiMouseButton_Left);
+        v.pan.x += d.x;
+        v.pan.y += d.y;
+        if (v.zoom == 0.f) v.zoom = fit;
+    }
+    if (ImGui::IsMouseDoubleClicked(ImGuiMouseButton_Left))
+    {
+        v.zoom = 0.f;
+        v.pan = ImVec2(0, 0);
+    }
+}
+
+static void DrawImagePane(const char* title, const GpuTexture& tex,
+                          const char* emptyHint, PaneView& view)
 {
     ImGui::BeginChild(title, ImVec2(0, 0), ImGuiChildFlags_Borders);
     ImGui::TextUnformatted(title);
-    ImGui::Separator();
-
-    ImVec2 avail = ImGui::GetContentRegionAvail();
     if (tex.srv && tex.w > 0 && tex.h > 0)
     {
-        const float sx = avail.x / float(tex.w);
-        const float sy = avail.y / float(tex.h);
-        const float s  = (sx < sy) ? sx : sy;
-        ImVec2 disp(float(tex.w) * s, float(tex.h) * s);
-        ImVec2 cur = ImGui::GetCursorPos();
-        ImGui::SetCursorPos(ImVec2(cur.x + (avail.x - disp.x) * 0.5f,
-                                   cur.y + (avail.y - disp.y) * 0.5f));
+        ImGui::SameLine();
+        const float displayZoom = (view.zoom > 0.f) ? view.zoom : FitScale(tex.w, tex.h, ImGui::GetContentRegionAvail());
+        ImGui::TextDisabled("  (%dx%d @ %.0f%%, wheel=zoom drag=pan dblclk=reset)", tex.w, tex.h, displayZoom * 100.f);
+    }
+    ImGui::Separator();
+
+    const ImVec2 avail = ImGui::GetContentRegionAvail();
+    if (tex.srv && tex.w > 0 && tex.h > 0)
+    {
+        HandlePaneInteraction(view, tex.w, tex.h, avail);
+
+        const float s = (view.zoom > 0.f) ? view.zoom : FitScale(tex.w, tex.h, avail);
+        const ImVec2 disp(float(tex.w) * s, float(tex.h) * s);
+        const ImVec2 cur = ImGui::GetCursorPos();
+        ImGui::SetCursorPos(ImVec2(cur.x + (avail.x - disp.x) * 0.5f + view.pan.x,
+                                   cur.y + (avail.y - disp.y) * 0.5f + view.pan.y));
         ImGui::Image((ImTextureID)(intptr_t)tex.srv, disp);
     }
     else
     {
         ImGui::TextDisabled("%s", emptyHint);
+    }
+    ImGui::EndChild();
+}
+
+// A/B comparison pane: input on the left of a draggable split line, output on the right.
+// Assumes both textures have identical dimensions (true: outputImg is Stylize(inputImg)).
+static void DrawSplitPane(const GpuTexture& a, const GpuTexture& b,
+                          PaneView& view, float& splitT)
+{
+    ImGui::BeginChild("##split", ImVec2(0, 0), ImGuiChildFlags_Borders);
+    ImGui::TextUnformatted("Compare (A/B)");
+    if (a.srv && b.srv && a.w == b.w && a.h == b.h)
+    {
+        ImGui::SameLine();
+        ImGui::TextDisabled("  drag the divider to compare");
+    }
+    ImGui::Separator();
+
+    const ImVec2 avail = ImGui::GetContentRegionAvail();
+    if (!a.srv || !b.srv || a.w != b.w || a.h != b.h)
+    {
+        ImGui::TextDisabled("Load an image and click Process to compare.");
+        ImGui::EndChild();
+        return;
+    }
+    HandlePaneInteraction(view, a.w, a.h, avail);
+
+    const float s = (view.zoom > 0.f) ? view.zoom : FitScale(a.w, a.h, avail);
+    const ImVec2 disp(float(a.w) * s, float(a.h) * s);
+    const ImVec2 cur = ImGui::GetCursorPos();
+    const ImVec2 origin(cur.x + (avail.x - disp.x) * 0.5f + view.pan.x,
+                        cur.y + (avail.y - disp.y) * 0.5f + view.pan.y);
+
+    splitT = std::clamp(splitT, 0.f, 1.f);
+    const float xSplit = disp.x * splitT;
+
+    // Left half: input.
+    ImGui::SetCursorPos(origin);
+    ImGui::Image((ImTextureID)(intptr_t)a.srv, ImVec2(xSplit, disp.y),
+                 ImVec2(0, 0), ImVec2(splitT, 1));
+    // Right half: output.
+    ImGui::SetCursorPos(ImVec2(origin.x + xSplit, origin.y));
+    ImGui::Image((ImTextureID)(intptr_t)b.srv, ImVec2(disp.x - xSplit, disp.y),
+                 ImVec2(splitT, 0), ImVec2(1, 1));
+
+    // Divider line + drag handle.
+    ImVec2 winPos = ImGui::GetWindowPos();
+    ImVec2 lineTop(winPos.x + origin.x + xSplit, winPos.y + origin.y);
+    ImVec2 lineBot(lineTop.x, lineTop.y + disp.y);
+    ImGui::GetWindowDrawList()->AddLine(lineTop, lineBot, IM_COL32(255, 255, 255, 200), 2.f);
+
+    // Drag the divider with right-mouse-button (left is reserved for pan).
+    if (ImGui::IsWindowHovered() && ImGui::IsMouseDragging(ImGuiMouseButton_Right, 0.f))
+    {
+        const float mx = ImGui::GetMousePos().x - (winPos.x + origin.x);
+        splitT = std::clamp(mx / disp.x, 0.f, 1.f);
     }
     ImGui::EndChild();
 }
@@ -278,6 +406,10 @@ static void DrawSettingsPanel(BrushStrokeParams& p)
 // ---------- Main ----------
 int main(int, char**)
 {
+    // Per-monitor DPI awareness (V2): the window participates in WM_DPICHANGED
+    // and non-client area scales correctly across multi-monitor setups.
+    ::SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
+
     WNDCLASSEXW wc = { sizeof(wc), CS_CLASSDC, WndProc, 0L, 0L,
                        GetModuleHandle(nullptr), nullptr, nullptr, nullptr, nullptr,
                        L"ImageEditor", nullptr };
@@ -294,13 +426,23 @@ int main(int, char**)
     }
     ::ShowWindow(hwnd, SW_SHOWDEFAULT);
     ::UpdateWindow(hwnd);
+    ::DragAcceptFiles(hwnd, TRUE);
 
     IMGUI_CHECKVERSION();
     ImGui::CreateContext();
     ImGuiIO& io = ImGui::GetIO();
     io.ConfigFlags |= ImGuiConfigFlags_NavEnableKeyboard;
-    (void)io;
     ImGui::StyleColorsDark();
+
+    // Initial DPI scale (refreshed lazily if monitor changes; full WM_DPICHANGED
+    // handling would also restyle fonts -- omitted for brevity).
+    {
+        const float dpi = float(::GetDpiForWindow(hwnd));
+        const float s   = dpi > 0.f ? (dpi / 96.f) : 1.f;
+        ImGui::GetStyle().ScaleAllSizes(s);
+        io.FontGlobalScale = s;
+    }
+
     ImGui_ImplWin32_Init(hwnd);
     ImGui_ImplDX11_Init(g_pd3dDevice, g_pd3dDeviceContext);
 
@@ -310,6 +452,10 @@ int main(int, char**)
     std::string  loadedPathDisplay;
     std::string  statusMsg = "Ready.";
     BrushStrokeParams params;
+
+    PaneView leftView, rightView, compareView;
+    bool     compareMode = false;
+    float    splitT      = 0.5f;
 
     // Async stylize job (off the UI thread). The worker reads input/params from the
     // job snapshot (so the user can keep tweaking sliders while it runs), writes the
@@ -325,6 +471,50 @@ int main(int, char**)
     } job;
 
     ImVec4 clear_color(0.10f, 0.10f, 0.12f, 1.0f);
+
+    // ---- Action helpers shared by buttons, drag-drop, and keyboard shortcuts ----
+    auto loadFromPath = [&](const std::wstring& path) {
+        if (job.running) { statusMsg = "Busy; cancel processing first."; return; }
+        Image img;
+        if (LoadImageFromPath(path.c_str(), img))
+        {
+            inputImg = std::move(img);
+            inputTex.Upload(g_pd3dDevice, inputImg);
+            outputImg.clear();
+            outputTex.Release();
+            loadedPathW = path;
+            loadedPathDisplay = WideToUtf8(path);
+            statusMsg = "Loaded.";
+            leftView = rightView = compareView = PaneView{};
+        }
+        else statusMsg = "Failed to load image.";
+    };
+    auto tryLoadDialog = [&]() {
+        if (job.running) return;
+        std::wstring path;
+        if (OpenFileDialog(hwnd, path)) loadFromPath(path);
+    };
+    auto tryProcess = [&]() {
+        if (!inputImg.valid() || job.running) return;
+        job.input  = inputImg;
+        job.params = params;
+        job.result.clear();
+        job.ctx.progress.store(0.f);
+        job.ctx.cancel.store(false);
+        job.done.store(false);
+        job.running = true;
+        job.worker = std::thread([&job]() {
+            job.result = Stylize(job.input, job.params, &job.ctx);
+            job.done.store(true, std::memory_order_release);
+        });
+        statusMsg = "Processing...";
+    };
+    auto trySave = [&]() {
+        if (!outputImg.valid() || job.running) return;
+        std::wstring path;
+        if (SaveFileDialog(hwnd, path))
+            statusMsg = SaveImageToPath(path.c_str(), outputImg) ? "Saved." : "Save failed.";
+    };
 
     bool done = false;
     while (!done)
@@ -344,6 +534,15 @@ int main(int, char**)
             g_pSwapChain->ResizeBuffers(0, g_ResizeWidth, g_ResizeHeight, DXGI_FORMAT_UNKNOWN, 0);
             g_ResizeWidth = g_ResizeHeight = 0;
             CreateRenderTarget();
+        }
+
+        // Consume a dropped file path (filled in by WM_DROPFILES on the UI thread).
+        if (g_hasDropped)
+        {
+            std::wstring p = std::move(g_droppedPath);
+            g_droppedPath.clear();
+            g_hasDropped = false;
+            loadFromPath(p);
         }
 
         // Consume finished stylize job (if any) before drawing UI.
@@ -377,55 +576,32 @@ int main(int, char**)
                                 | ImGuiWindowFlags_NoBringToFrontOnFocus;
         ImGui::Begin("##root", nullptr, wflags);
 
+        // Keyboard shortcuts (route through helpers so behavior matches buttons).
+        if (!ImGui::GetIO().WantTextInput)
+        {
+            if (ImGui::Shortcut(ImGuiMod_Ctrl | ImGuiKey_O, ImGuiInputFlags_RouteGlobal)) tryLoadDialog();
+            if (ImGui::Shortcut(ImGuiMod_Ctrl | ImGuiKey_S, ImGuiInputFlags_RouteGlobal)) trySave();
+            if (ImGui::Shortcut(ImGuiKey_Space,             ImGuiInputFlags_RouteGlobal)) tryProcess();
+        }
+
         // Toolbar
         ImGui::BeginDisabled(job.running);
-        if (ImGui::Button("Load"))
-        {
-            std::wstring path;
-            if (OpenFileDialog(hwnd, path))
-            {
-                Image img;
-                if (LoadImageFromPath(path.c_str(), img))
-                {
-                    inputImg = std::move(img);
-                    inputTex.Upload(g_pd3dDevice, inputImg);
-                    outputImg.clear();
-                    outputTex.Release();
-                    loadedPathW = path;
-                    loadedPathDisplay = WideToUtf8(path);
-                    statusMsg = "Loaded.";
-                }
-                else statusMsg = "Failed to load image.";
-            }
-        }
+        if (ImGui::Button("Load")) tryLoadDialog();
+        if (ImGui::IsItemHovered()) ImGui::SetTooltip("Open image (Ctrl+O) -- you can also drop a file onto this window");
         ImGui::EndDisabled();
         ImGui::SameLine();
         ImGui::BeginDisabled(!inputImg.valid() || job.running);
-        if (ImGui::Button("Process"))
-        {
-            job.input  = inputImg;
-            job.params = params;
-            job.result.clear();
-            job.ctx.progress.store(0.f);
-            job.ctx.cancel.store(false);
-            job.done.store(false);
-            job.running = true;
-            job.worker = std::thread([&job]() {
-                job.result = Stylize(job.input, job.params, &job.ctx);
-                job.done.store(true, std::memory_order_release);
-            });
-            statusMsg = "Processing...";
-        }
+        if (ImGui::Button("Process")) tryProcess();
+        if (ImGui::IsItemHovered()) ImGui::SetTooltip("Run brush-stroke stylize (Space)");
         ImGui::EndDisabled();
         ImGui::SameLine();
         ImGui::BeginDisabled(!outputImg.valid() || job.running);
-        if (ImGui::Button("Save"))
-        {
-            std::wstring path;
-            if (SaveFileDialog(hwnd, path))
-                statusMsg = SaveImageToPath(path.c_str(), outputImg) ? "Saved." : "Save failed.";
-        }
+        if (ImGui::Button("Save")) trySave();
+        if (ImGui::IsItemHovered()) ImGui::SetTooltip("Save output (Ctrl+S)");
         ImGui::EndDisabled();
+        ImGui::SameLine();
+        ImGui::Checkbox("A/B", &compareMode);
+        if (ImGui::IsItemHovered()) ImGui::SetTooltip("Side-by-side compare (right-drag divider in the viewer)");
 
         if (job.running)
         {
@@ -455,16 +631,23 @@ int main(int, char**)
         ImGui::EndChild();
         ImGui::SameLine();
 
-        // Two-pane viewer
+        // Viewer: two-pane (default) or A/B split.
         ImGui::BeginChild("##panes", ImVec2(0, availH));
-        const float halfW = ImGui::GetContentRegionAvail().x * 0.5f - 4.f;
-        ImGui::BeginChild("##left", ImVec2(halfW, 0));
-        DrawImagePane("Input", inputTex, "Click [Load] to pick an image.");
-        ImGui::EndChild();
-        ImGui::SameLine();
-        ImGui::BeginChild("##right", ImVec2(0, 0));
-        DrawImagePane("Output", outputTex, "Click [Process] after loading an image.");
-        ImGui::EndChild();
+        if (compareMode)
+        {
+            DrawSplitPane(inputTex, outputTex, compareView, splitT);
+        }
+        else
+        {
+            const float halfW = ImGui::GetContentRegionAvail().x * 0.5f - 4.f;
+            ImGui::BeginChild("##left", ImVec2(halfW, 0));
+            DrawImagePane("Input", inputTex, "Click [Load] or drop an image here.", leftView);
+            ImGui::EndChild();
+            ImGui::SameLine();
+            ImGui::BeginChild("##right", ImVec2(0, 0));
+            DrawImagePane("Output", outputTex, "Click [Process] after loading an image.", rightView);
+            ImGui::EndChild();
+        }
         ImGui::EndChild();
 
         ImGui::End();
@@ -570,6 +753,29 @@ static LRESULT WINAPI WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam)
         g_ResizeWidth  = (UINT)LOWORD(lParam);
         g_ResizeHeight = (UINT)HIWORD(lParam);
         return 0;
+    case WM_DROPFILES:
+    {
+        HDROP hDrop = (HDROP)wParam;
+        wchar_t buf[MAX_PATH] = L"";
+        if (DragQueryFileW(hDrop, 0, buf, MAX_PATH))
+        {
+            g_droppedPath = buf;
+            g_hasDropped  = true;
+        }
+        DragFinish(hDrop);
+        return 0;
+    }
+    case WM_DPICHANGED:
+    {
+        // Resize the window per the new DPI rect. Font rescale is intentionally
+        // not handled here; the initial DPI is captured at startup.
+        const RECT* prc = reinterpret_cast<const RECT*>(lParam);
+        ::SetWindowPos(hWnd, nullptr, prc->left, prc->top,
+                       prc->right  - prc->left,
+                       prc->bottom - prc->top,
+                       SWP_NOZORDER | SWP_NOACTIVATE);
+        return 0;
+    }
     case WM_SYSCOMMAND:
         if ((wParam & 0xfff0) == SC_KEYMENU) return 0;
         break;
