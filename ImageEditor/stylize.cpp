@@ -216,12 +216,15 @@ struct WalkInputs
     const std::vector<float>*  gx;
     const std::vector<float>*  gy;
     const std::vector<float>*  mag;
+    const std::vector<float>*  jitterField;     // nullable; null = no jitter (coast)
     Canvas*                    canvas;
     int                        w;
     int                        h;
     float                      gradientThreshold;
     float                      curvatureFilter; // 0..1
     float                      colorTolSq;      // squared
+    float                      baseAngle;       // textureAngleDeg in radians
+    float                      jitterRad;       // textureJitterDeg in radians
     int                        radius;
     int                        steps;
     bool                       blend;
@@ -250,24 +253,36 @@ static void WalkHalf(const WalkInputs& W,
 
         PaintDisk(*W.canvas, ix, iy, W.radius, br, bg, bb, W.blend, W.alpha);
 
-        // Tangent update - only when local gradient is significant.
-        if ((*W.mag)[idx] >= W.gradientThreshold)
+        // Tangent update. In gradient-rich regions we follow the local tangent;
+        // in flat regions we follow the precomputed jitter field (if present).
+        // Both branches blend with the previous direction via curvatureFilter so
+        // the stroke curves smoothly instead of snapping.
+        const bool highGrad = ((*W.mag)[idx] >= W.gradientThreshold);
+        float lx = 0.f, ly = 0.f;
+        bool haveTarget = false;
+        if (highGrad)
         {
-            float lx = -(*W.gy)[idx];
-            float ly =  (*W.gx)[idx];
+            lx = -(*W.gy)[idx];
+            ly =  (*W.gx)[idx];
             const float L = std::sqrt(lx * lx + ly * ly);
-            if (L > 1e-6f)
-            {
-                lx /= L; ly /= L;
-                if (lx * ptx + ly * pty < 0.f) { lx = -lx; ly = -ly; }
-                const float fc = W.curvatureFilter;
-                float nx = fc * lx + (1.f - fc) * ptx;
-                float ny = fc * ly + (1.f - fc) * pty;
-                const float NL = std::sqrt(nx * nx + ny * ny);
-                if (NL > 1e-6f) { ptx = nx / NL; pty = ny / NL; }
-            }
+            if (L > 1e-6f) { lx /= L; ly /= L; haveTarget = true; }
         }
-        // else: keep (ptx,pty) - coast through low-gradient regions.
+        else if (W.jitterField && !W.jitterField->empty())
+        {
+            const float ang = W.baseAngle + (*W.jitterField)[idx] * W.jitterRad;
+            lx = std::cos(ang); ly = std::sin(ang);
+            haveTarget = true;
+        }
+        if (haveTarget)
+        {
+            if (lx * ptx + ly * pty < 0.f) { lx = -lx; ly = -ly; }
+            const float fc = W.curvatureFilter;
+            float nx = fc * lx + (1.f - fc) * ptx;
+            float ny = fc * ly + (1.f - fc) * pty;
+            const float NL = std::sqrt(nx * nx + ny * ny);
+            if (NL > 1e-6f) { ptx = nx / NL; pty = ny / NL; }
+        }
+        // else: jitter disabled and gradient is flat -- coast.
     }
 }
 
@@ -410,10 +425,14 @@ Image Stylize(const Image& src, const BrushStrokeParams& p, StylizeContext* ctx)
     const float baseAngle = p.textureAngleDeg * float(std::numbers::pi) / 180.f;
     const float jitterRad = std::clamp(p.textureJitterDeg, 0.f, 90.f) * float(std::numbers::pi) / 180.f;
 
-    // Smooth jitter field: uniform random per pixel, heavily blurred, then renormalized
-    // to roughly [-1, 1]. Each pixel's fallback stroke direction is rotated by
-    // jitterField[i] * jitterRad off baseAngle, so flat regions get organic flow
-    // instead of one global angle. Built only when jitter > 0.
+    // Smooth jitter field: uniform random per pixel, blurred for spatial coherence,
+    // then normalized by its own standard deviation (so a typical pixel produces a
+    // meaningful jitter, not just the rare extremes), then clamped to [-1,1].
+    //
+    // Gaussian blur of uniform noise collapses its dynamic range -- max-abs
+    // normalization (the previous behavior) made most pixels read ~0 because only
+    // a few outliers reached the +/-1 ends. Stddev normalization lifts the typical
+    // pixel to about |1.0| * jitterRad, which is what the user expects.
     std::vector<float> jitterField;
     if (jitterRad > 0.f)
     {
@@ -421,13 +440,22 @@ Image Stylize(const Image& src, const BrushStrokeParams& p, StylizeContext* ctx)
         std::mt19937 jrng(p.seed ^ 0xC0FFEEu);
         std::uniform_real_distribution<float> uds(-1.f, 1.f);
         for (size_t i = 0; i < N; ++i) jitterField[i] = uds(jrng);
-        // Blur sigma scales with image size: ~5% of the shorter side, floor 8 px.
-        const float sigma = std::max(8.f, float(std::min(w, h)) * 0.05f);
+        // Blur sigma scales with image size. 2.5% of the shorter side keeps swirl
+        // regions visible at a typical viewport zoom without being chaotic.
+        const float sigma = std::max(6.f, float(std::min(w, h)) * 0.025f);
         BlurSeparable(jitterField, w, h, sigma);
-        float maxAbs = 0.f;
-        for (float v : jitterField) maxAbs = std::max(maxAbs, std::abs(v));
-        if (maxAbs > 1e-6f)
-            for (float& v : jitterField) v /= maxAbs;
+
+        // Online stddev (mean is ~0 for blurred symmetric noise; assume so).
+        double sumSq = 0.0;
+        for (float v : jitterField) sumSq += double(v) * double(v);
+        const double stddev = std::sqrt(sumSq / double(std::max<size_t>(1, N)));
+        if (stddev > 1e-6)
+        {
+            const float invS = float(1.0 / stddev);
+#pragma omp parallel for schedule(static)
+            for (int i = 0; i < (int)N; ++i)
+                jitterField[i] = std::clamp(jitterField[i] * invS, -1.f, 1.f);
+        }
     }
 
     // Returns the per-pixel fallback direction (cos/sin) at the given pixel index.
@@ -466,11 +494,14 @@ Image Stylize(const Image& src, const BrushStrokeParams& p, StylizeContext* ctx)
     // Reusable WalkInputs (radius/steps mutated per scale)
     WalkInputs W{};
     W.src = &src; W.gx = &gx; W.gy = &gy; W.mag = &mag;
+    W.jitterField = jitterField.empty() ? nullptr : &jitterField;
     W.canvas = &canvas;
     W.w = w; W.h = h;
     W.gradientThreshold = p.gradientThreshold;
     W.curvatureFilter   = std::clamp(p.curvatureFilter, 0.f, 1.f);
     W.colorTolSq        = p.colorTolerance * p.colorTolerance;
+    W.baseAngle         = baseAngle;
+    W.jitterRad         = jitterRad;
     W.blend             = p.blend;
     W.alpha             = p.blendAlpha;
 
