@@ -23,6 +23,9 @@ struct BrushStrokeParams
     float    curvatureFilter   = 0.5f;  // 0..1; fc - 0 = keep prev dir, 1 = snap to local
     float    colorTolerance    = 60.f;  // 0..441; stop a stroke if |src - brush| exceeds
     float    textureAngleDeg   = 0.f;   // canvas direction used in low-gradient regions
+    float    textureJitterDeg  = 30.f;  // 0..90; per-pixel deviation from textureAngleDeg,
+                                        // smoothed across the image (low-frequency noise field).
+                                        // 0 reproduces the old fixed-angle behavior.
 
     // Compositing
     bool     blend             = false;

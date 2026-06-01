@@ -406,10 +406,38 @@ Image Stylize(const Image& src, const BrushStrokeParams& p, StylizeContext* ctx)
     std::vector<uint8_t> painted(N, 0);
     Canvas canvas{ dst.rgba.data(), painted.data(), w, h };
 
-    // Texture (canvas) direction for low-gradient regions
-    const float ang = p.textureAngleDeg * float(std::numbers::pi) / 180.f;
-    const float texDirX = std::cos(ang);
-    const float texDirY = std::sin(ang);
+    // Texture (canvas) base direction for low-gradient regions.
+    const float baseAngle = p.textureAngleDeg * float(std::numbers::pi) / 180.f;
+    const float jitterRad = std::clamp(p.textureJitterDeg, 0.f, 90.f) * float(std::numbers::pi) / 180.f;
+
+    // Smooth jitter field: uniform random per pixel, heavily blurred, then renormalized
+    // to roughly [-1, 1]. Each pixel's fallback stroke direction is rotated by
+    // jitterField[i] * jitterRad off baseAngle, so flat regions get organic flow
+    // instead of one global angle. Built only when jitter > 0.
+    std::vector<float> jitterField;
+    if (jitterRad > 0.f)
+    {
+        jitterField.assign(N, 0.f);
+        std::mt19937 jrng(p.seed ^ 0xC0FFEEu);
+        std::uniform_real_distribution<float> uds(-1.f, 1.f);
+        for (size_t i = 0; i < N; ++i) jitterField[i] = uds(jrng);
+        // Blur sigma scales with image size: ~5% of the shorter side, floor 8 px.
+        const float sigma = std::max(8.f, float(std::min(w, h)) * 0.05f);
+        BlurSeparable(jitterField, w, h, sigma);
+        float maxAbs = 0.f;
+        for (float v : jitterField) maxAbs = std::max(maxAbs, std::abs(v));
+        if (maxAbs > 1e-6f)
+            for (float& v : jitterField) v /= maxAbs;
+    }
+
+    // Returns the per-pixel fallback direction (cos/sin) at the given pixel index.
+    auto fallbackDir = [&](size_t idx, float& outX, float& outY)
+    {
+        float ang = baseAngle;
+        if (!jitterField.empty()) ang += jitterField[idx] * jitterRad;
+        outX = std::cos(ang);
+        outY = std::sin(ang);
+    };
 
     // Build the brush radii ladder (geometric halving, descending)
     std::vector<int> radii;
@@ -497,7 +525,9 @@ Image Stylize(const Image& src, const BrushStrokeParams& p, StylizeContext* ctx)
             const int idx = seeds[i];
             const int sy = idx / w;
             const int sx = idx % w;
-            RunStroke(W, sat, sx, sy, colorHalf, texDirX, texDirY);
+            float fx, fy;
+            fallbackDir(size_t(idx), fx, fy);
+            RunStroke(W, sat, sx, sy, colorHalf, fx, fy);
         }
         progressBase += perScaleShare;
         report(progressBase);
@@ -516,7 +546,9 @@ Image Stylize(const Image& src, const BrushStrokeParams& p, StylizeContext* ctx)
                 for (int idx : empties)
                 {
                     if (painted[idx]) continue;
-                    RunStroke(W, sat, idx % w, idx / w, colorHalf, texDirX, texDirY);
+                    float fx, fy;
+                    fallbackDir(size_t(idx), fx, fy);
+                    RunStroke(W, sat, idx % w, idx / w, colorHalf, fx, fy);
                 }
                 report(progressBase + kRefillShare * float(pass + 1) / float(passes));
             }

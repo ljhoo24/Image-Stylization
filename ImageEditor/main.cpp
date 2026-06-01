@@ -388,6 +388,9 @@ static void DrawSettingsPanel(BrushStrokeParams& p)
         ImGui::SliderFloat("Curve smooth",&p.curvatureFilter, 0.f, 1.f, "%.2f");
         ImGui::SliderFloat("Color tol",   &p.colorTolerance, 0.f, 200.f, "%.1f");
         ImGui::SliderFloat("Texture deg", &p.textureAngleDeg, 0.f, 359.f, "%.0f");
+        ImGui::SliderFloat("Texture jitter", &p.textureJitterDeg, 0.f, 90.f, "%.0f deg");
+        if (ImGui::IsItemHovered())
+            ImGui::SetTooltip("Per-pixel deviation in flat regions, smoothed across the image.\n0 = old fixed-angle behavior. Reseed for a different swirl pattern.");
     }
 
     if (ImGui::CollapsingHeader("Compositing"))
