@@ -250,7 +250,7 @@ static void RunStroke(const WalkInputs& W,
 } // namespace
 
 // --------------------------------------------------------------------------
-Image Stylize(const Image& src, const BrushStrokeParams& p)
+Image Stylize(const Image& src, const BrushStrokeParams& p, StylizeContext* ctx)
 {
     Image dst;
     if (!src.valid()) return dst;
@@ -258,6 +258,10 @@ Image Stylize(const Image& src, const BrushStrokeParams& p)
     const size_t N = size_t(w) * h;
     dst.w = w; dst.h = h;
     dst.rgba.assign(N * 4, 0);
+
+    auto report    = [&](float v) { if (ctx) ctx->progress.store(v, std::memory_order_relaxed); };
+    auto cancelled = [&]() { return ctx && ctx->cancel.load(std::memory_order_relaxed); };
+    report(0.f);
 
     // 1) gradient (luma -> blur -> Sobel 3x3)
     std::vector<float> gray = ToGrayLuma(src);
@@ -276,8 +280,8 @@ Image Stylize(const Image& src, const BrushStrokeParams& p)
 
     // Texture (canvas) direction for low-gradient regions
     const float ang = p.textureAngleDeg * float(std::numbers::pi) / 180.f;
-    const float ctx = std::cos(ang);
-    const float cty = std::sin(ang);
+    const float texDirX = std::cos(ang);
+    const float texDirY = std::sin(ang);
 
     // Build the brush radii ladder (geometric halving, descending)
     std::vector<int> radii;
@@ -296,6 +300,15 @@ Image Stylize(const Image& src, const BrushStrokeParams& p)
     std::mt19937 rng(p.seed);
     std::uniform_int_distribution<int> ux(0, w - 1), uy(0, h - 1);
 
+    // Progress budget: 5% prep + 85% scales (equal split) + 10% refill (scale 0).
+    // Refill share is included even when maxRefillPasses==0 so the bar still reaches 1.0.
+    report(0.05f);
+    if (cancelled()) return Image{};
+
+    const float kScalesShare = 0.85f;
+    const float kRefillShare = 0.10f;
+    const float perScaleShare = kScalesShare / float(radii.size());
+
     // Reusable WalkInputs (radius/steps mutated per scale)
     WalkInputs W{};
     W.src = &src; W.gx = &gx; W.gy = &gy; W.mag = &mag;
@@ -308,8 +321,11 @@ Image Stylize(const Image& src, const BrushStrokeParams& p)
     W.alpha             = p.blendAlpha;
 
     // ---- Multi-scale loop (largest to smallest) -------------------------
+    float progressBase = 0.05f;
     for (size_t scaleIdx = 0; scaleIdx < radii.size(); ++scaleIdx)
     {
+        if (cancelled()) return Image{};
+
         const int R = radii[scaleIdx];
         const int strokeLen = std::max(2, (int)std::lround((double)p.strokeLength * (double)R / (double)maxR));
         W.radius = R;
@@ -347,18 +363,28 @@ Image Stylize(const Image& src, const BrushStrokeParams& p)
             seeds.assign(highError.begin(), highError.begin() + std::min<size_t>(take, highError.size()));
         }
 
-        for (int idx : seeds)
+        for (size_t i = 0; i < seeds.size(); ++i)
         {
+            if ((i & 4095u) == 4095u)
+            {
+                if (cancelled()) return Image{};
+                report(progressBase + perScaleShare * float(i + 1) / float(seeds.size()));
+            }
+            const int idx = seeds[i];
             const int sy = idx / w;
             const int sx = idx % w;
-            RunStroke(W, sx, sy, ctx, cty);
+            RunStroke(W, sx, sy, texDirX, texDirY);
         }
+        progressBase += perScaleShare;
+        report(progressBase);
 
         // Refill only on the first (coarsest) scale to guarantee coverage.
         if (scaleIdx == 0)
         {
-            for (int pass = 0; pass < p.maxRefillPasses; ++pass)
+            const int passes = std::max(0, p.maxRefillPasses);
+            for (int pass = 0; pass < passes; ++pass)
             {
+                if (cancelled()) return Image{};
                 std::vector<int> empties;
                 empties.reserve(N / 8);
                 for (size_t i = 0; i < N; ++i)
@@ -368,8 +394,9 @@ Image Stylize(const Image& src, const BrushStrokeParams& p)
                 for (int idx : empties)
                 {
                     if (painted[idx]) continue;
-                    RunStroke(W, idx % w, idx / w, ctx, cty);
+                    RunStroke(W, idx % w, idx / w, texDirX, texDirY);
                 }
+                report(progressBase + kRefillShare * float(pass + 1) / float(passes));
             }
             // Final 1-px dab for stragglers (rare; keeps the canvas covered).
             for (size_t i = 0; i < N; ++i)
@@ -382,8 +409,11 @@ Image Stylize(const Image& src, const BrushStrokeParams& p)
                 q[0] = br; q[1] = bg; q[2] = bb; q[3] = 255;
                 painted[i] = 1;
             }
+            progressBase += kRefillShare;
+            report(progressBase);
         }
     }
 
+    report(1.f);
     return dst;
 }

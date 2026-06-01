@@ -13,10 +13,12 @@
 #include <commdlg.h>
 #include <shellapi.h>
 
+#include <atomic>
 #include <cstdio>
 #include <cstdint>
 #include <cwctype>
 #include <string>
+#include <thread>
 #include <vector>
 
 #define STB_IMAGE_IMPLEMENTATION
@@ -295,6 +297,19 @@ int main(int, char**)
     std::string  statusMsg = "Ready.";
     BrushStrokeParams params;
 
+    // Async stylize job (off the UI thread). The worker reads input/params from the
+    // job snapshot (so the user can keep tweaking sliders while it runs), writes the
+    // result, then sets `done`. Main thread polls `done` and consumes the result.
+    struct StylizeJob {
+        std::thread       worker;
+        Image             input;
+        BrushStrokeParams params;
+        Image             result;
+        StylizeContext    ctx;
+        std::atomic<bool> done{ false };
+        bool              running = false;
+    } job;
+
     ImVec4 clear_color(0.10f, 0.10f, 0.12f, 1.0f);
 
     bool done = false;
@@ -317,6 +332,25 @@ int main(int, char**)
             CreateRenderTarget();
         }
 
+        // Consume finished stylize job (if any) before drawing UI.
+        if (job.running && job.done.load(std::memory_order_acquire))
+        {
+            if (job.worker.joinable()) job.worker.join();
+            const bool wasCancelled = job.ctx.cancel.load();
+            if (!wasCancelled && job.result.valid())
+            {
+                outputImg = std::move(job.result);
+                outputTex.Upload(g_pd3dDevice, outputImg);
+                statusMsg = "Processed.";
+            }
+            else
+            {
+                statusMsg = wasCancelled ? "Cancelled." : "Process failed.";
+            }
+            job.result.clear();
+            job.running = false;
+        }
+
         ImGui_ImplDX11_NewFrame();
         ImGui_ImplWin32_NewFrame();
         ImGui::NewFrame();
@@ -330,6 +364,7 @@ int main(int, char**)
         ImGui::Begin("##root", nullptr, wflags);
 
         // Toolbar
+        ImGui::BeginDisabled(job.running);
         if (ImGui::Button("Load"))
         {
             std::wstring path;
@@ -349,17 +384,27 @@ int main(int, char**)
                 else statusMsg = "Failed to load image.";
             }
         }
+        ImGui::EndDisabled();
         ImGui::SameLine();
-        ImGui::BeginDisabled(!inputImg.valid());
+        ImGui::BeginDisabled(!inputImg.valid() || job.running);
         if (ImGui::Button("Process"))
         {
-            outputImg = Stylize(inputImg, params);
-            outputTex.Upload(g_pd3dDevice, outputImg);
-            statusMsg = "Processed.";
+            job.input  = inputImg;
+            job.params = params;
+            job.result.clear();
+            job.ctx.progress.store(0.f);
+            job.ctx.cancel.store(false);
+            job.done.store(false);
+            job.running = true;
+            job.worker = std::thread([&job]() {
+                job.result = Stylize(job.input, job.params, &job.ctx);
+                job.done.store(true, std::memory_order_release);
+            });
+            statusMsg = "Processing...";
         }
         ImGui::EndDisabled();
         ImGui::SameLine();
-        ImGui::BeginDisabled(!outputImg.valid());
+        ImGui::BeginDisabled(!outputImg.valid() || job.running);
         if (ImGui::Button("Save"))
         {
             std::wstring path;
@@ -367,6 +412,14 @@ int main(int, char**)
                 statusMsg = SaveImageToPath(path.c_str(), outputImg) ? "Saved." : "Save failed.";
         }
         ImGui::EndDisabled();
+
+        if (job.running)
+        {
+            ImGui::SameLine();
+            if (ImGui::Button("Cancel")) job.ctx.cancel.store(true);
+            ImGui::SameLine();
+            ImGui::ProgressBar(job.ctx.progress.load(), ImVec2(200.f, 0.f));
+        }
 
         ImGui::SameLine();
         ImGui::TextDisabled("|");
@@ -410,6 +463,14 @@ int main(int, char**)
         ImGui_ImplDX11_RenderDrawData(ImGui::GetDrawData());
 
         g_pSwapChain->Present(1, 0);
+    }
+
+    // Make sure the stylize worker is finished before we tear down resources.
+    if (job.running)
+    {
+        job.ctx.cancel.store(true);
+        if (job.worker.joinable()) job.worker.join();
+        job.running = false;
     }
 
     inputTex.Release();

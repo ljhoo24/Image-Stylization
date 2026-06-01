@@ -1,4 +1,5 @@
 #pragma once
+#include <atomic>
 #include <cstdint>
 #include "image.h"
 
@@ -32,4 +33,13 @@ struct BrushStrokeParams
     uint32_t seed              = 12345u;
 };
 
-Image Stylize(const Image& src, const BrushStrokeParams& p);
+// Optional progress + cancellation channel. Pass nullptr for fire-and-forget.
+// progress is monotonically advanced in [0,1]; cancel is polled at safe points
+// and, if set, makes Stylize() return an empty Image.
+struct StylizeContext
+{
+    std::atomic<float> progress{ 0.f };
+    std::atomic<bool>  cancel{ false };
+};
+
+Image Stylize(const Image& src, const BrushStrokeParams& p, StylizeContext* ctx = nullptr);
